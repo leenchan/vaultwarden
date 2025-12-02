@@ -312,6 +312,14 @@ impl User {
             }
         }
 
+        // Logout from Keycloak for all devices before deleting them
+        if CONFIG.sso_enabled() {
+            let devices = Device::find_by_user(&self.uuid, conn).await;
+            for device in &devices {
+                crate::sso::logout_from_keycloak(device, conn).await;
+            }
+        }
+
         super::Send::delete_all_by_user(&self.uuid, conn).await?;
         EmergencyAccess::delete_all_by_user(&self.uuid, conn).await?;
         EmergencyAccess::delete_all_by_grantee_email(&self.email, conn).await?;

@@ -8,6 +8,7 @@ use url::Url;
 use crate::{
     api::{ApiResult, EmptyResult},
     db::models::SsoNonce,
+    error::Error,
     sso::{OIDCCode, OIDCState},
     CONFIG,
 };
@@ -241,6 +242,203 @@ impl Client {
             token_response.access_token().secret().clone(),
             token_response.expires_in(),
         ))
+    }
+
+    /// Logout from Keycloak by revoking the refresh token
+    /// This calls the Keycloak logout endpoint to invalidate the session
+    pub async fn logout(refresh_token: String) -> EmptyResult {
+        let issuer_url = CONFIG.sso_issuer_url()?;
+        let logout_url = format!("{}/protocol/openid-connect/logout", issuer_url.as_str());
+
+        let client_id = CONFIG.sso_client_id();
+        let client_secret = CONFIG.sso_client_secret();
+
+        // Build the logout request
+        let mut params = std::collections::HashMap::new();
+        params.insert("refresh_token", refresh_token);
+        params.insert("client_id", client_id);
+        params.insert("client_secret", client_secret);
+
+        let client = Self::cached().await?;
+        match client
+            .http_client
+            .post(&logout_url)
+            .form(&params)
+            .send()
+            .await
+        {
+            Ok(response) => {
+                if response.status().is_success() {
+                    debug!("Successfully logged out from Keycloak");
+                    Ok(())
+                } else {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    warn!("Keycloak logout returned status {}: {}", status, body);
+                    // Don't fail logout if Keycloak logout fails - user is already logged out locally
+                    Ok(())
+                }
+            }
+            Err(e) => {
+                warn!("Failed to call Keycloak logout endpoint: {}", e);
+                // Don't fail logout if Keycloak logout fails - user is already logged out locally
+                Ok(())
+            }
+        }
+    }
+
+    /// Logout user from Keycloak by email using Admin API
+    /// This finds the user by email and logs out all their sessions
+    pub async fn logout_by_email(email: &str) -> EmptyResult {
+        let issuer_url = CONFIG.sso_issuer_url()?;
+        
+        // Get admin API base URL (format: https://keycloak.example.com/admin/realms/{realm})
+        let admin_base_url = extract_admin_base_url(&issuer_url)?;
+        
+        let client_id = CONFIG.sso_client_id();
+        let client_secret = CONFIG.sso_client_secret();
+
+        // Get admin access token using client credentials grant
+        let admin_token = get_admin_token(&issuer_url, &client_id, &client_secret).await?;
+
+        let client = Self::cached().await?;
+
+        // Find user by email
+        let user_id = find_user_by_email(&client.http_client, &admin_base_url, &admin_token, email).await?;
+
+        // Logout user from all sessions
+        logout_user_sessions(&client.http_client, &admin_base_url, &admin_token, &user_id).await?;
+
+        Ok(())
+    }
+}
+
+/// Extract realm name from Keycloak issuer URL
+/// Format: https://keycloak.example.com/realms/{realm}
+fn extract_realm_from_issuer(issuer_url: &str) -> ApiResult<String> {
+    let url = Url::parse(issuer_url).map_err(|e| Error::new_msg(format!("Failed to parse issuer URL: {}", e)))?;
+    let path = url.path();
+    
+    // Extract realm from path like "/realms/{realm}"
+    if let Some(realm_start) = path.rfind("/realms/") {
+        let realm_part = &path[realm_start + 8..]; // 8 = len("/realms/")
+        if realm_part.is_empty() {
+            err!("Realm name is empty in issuer URL");
+        }
+        Ok(realm_part.to_string())
+    } else {
+        err!("Failed to extract realm from issuer URL: {}", issuer_url)
+    }
+}
+
+/// Extract admin API base URL from issuer URL
+/// Format: https://keycloak.example.com/admin/realms/{realm}
+fn extract_admin_base_url(issuer_url: &str) -> ApiResult<String> {
+    let _url = Url::parse(issuer_url).map_err(|e| Error::new_msg(format!("Failed to parse issuer URL: {}", e)))?;
+    let realm = extract_realm_from_issuer(issuer_url)?;
+    
+    // Replace "/realms/{realm}" with "/admin/realms/{realm}"
+    let admin_url = issuer_url.replace(&format!("/realms/{}", realm), &format!("/admin/realms/{}", realm));
+    Ok(admin_url)
+}
+
+/// Get admin access token using client credentials grant
+async fn get_admin_token(issuer_url: &str, client_id: &str, client_secret: &str) -> ApiResult<String> {
+    let token_url = format!("{}/protocol/openid-connect/token", issuer_url);
+    
+    let client = reqwest::Client::new();
+    let mut params = std::collections::HashMap::new();
+    params.insert("grant_type", "client_credentials");
+    params.insert("client_id", client_id);
+    params.insert("client_secret", client_secret);
+
+    let response = client
+        .post(&token_url)
+        .form(&params)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let body = response.text().await.unwrap_or_default();
+        err!(format!("Failed to get admin token: {}", body));
+    }
+
+    let json: serde_json::Value = response.json().await?;
+    let access_token = json
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::new_msg("No access_token in response"))?;
+
+    Ok(access_token.to_string())
+}
+
+/// Find user by email using Keycloak Admin API
+async fn find_user_by_email(
+    http_client: &reqwest::Client,
+    admin_base_url: &str,
+    admin_token: &str,
+    email: &str,
+) -> ApiResult<String> {
+    // Build URL with query parameter
+    let mut url = Url::parse(admin_base_url).map_err(|e| Error::new_msg(format!("Failed to parse admin base URL: {}", e)))?;
+    url.path_segments_mut()
+        .map_err(|_| Error::new_msg("Invalid admin base URL"))?
+        .push("users");
+    url.query_pairs_mut().append_pair("email", email);
+    let users_url = url.to_string();
+
+    let response = http_client
+        .get(&users_url)
+        .header("Authorization", format!("Bearer {}", admin_token))
+        .header("Content-Type", "application/json")
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let body = response.text().await.unwrap_or_default();
+        err!(format!("Failed to find user by email: {}", body));
+    }
+
+    let users: Vec<serde_json::Value> = response.json().await?;
+    
+    if users.is_empty() {
+        err!(format!("User with email {} not found in Keycloak", email));
+    }
+
+    // Get the first user's ID
+    let user_id = users[0]
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::new_msg("No user ID in response"))?;
+
+    Ok(user_id.to_string())
+}
+
+/// Logout user from all sessions using Keycloak Admin API
+async fn logout_user_sessions(
+    http_client: &reqwest::Client,
+    admin_base_url: &str,
+    admin_token: &str,
+    user_id: &str,
+) -> EmptyResult {
+    let logout_url = format!("{}/users/{}/logout", admin_base_url, user_id);
+
+    let response = http_client
+        .post(&logout_url)
+        .header("Authorization", format!("Bearer {}", admin_token))
+        .header("Content-Type", "application/json")
+        .send()
+        .await?;
+
+    if response.status().is_success() {
+        debug!("Successfully logged out user {} from all Keycloak sessions", user_id);
+        Ok(())
+    } else {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        warn!("Keycloak logout returned status {}: {}", status, body);
+        // Don't fail logout if Keycloak logout fails
+        Ok(())
     }
 }
 

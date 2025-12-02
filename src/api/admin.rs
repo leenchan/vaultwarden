@@ -30,6 +30,7 @@ use crate::{
     error::{Error, MapResult},
     http_client::make_http_request,
     mail,
+    sso,
     util::{
         container_base_image, format_naive_datetime_local, get_display_size, get_web_vault_version,
         is_running_in_container, NumberOrString,
@@ -471,6 +472,14 @@ async fn deauth_user(user_id: UserId, _token: AdminToken, conn: DbConn, nt: Noti
         }
     }
 
+    // Logout from Keycloak for all devices before deleting them
+    if CONFIG.sso_enabled() {
+        let devices = Device::find_by_user(&user.uuid, &conn).await;
+        for device in &devices {
+            sso::logout_from_keycloak(device, &conn).await;
+        }
+    }
+
     Device::delete_all_by_user(&user.uuid, &conn).await?;
     user.reset_security_stamp();
 
@@ -480,6 +489,15 @@ async fn deauth_user(user_id: UserId, _token: AdminToken, conn: DbConn, nt: Noti
 #[post("/users/<user_id>/disable", format = "application/json")]
 async fn disable_user(user_id: UserId, _token: AdminToken, conn: DbConn, nt: Notify<'_>) -> EmptyResult {
     let mut user = get_user_or_404(&user_id, &conn).await?;
+
+    // Logout from Keycloak for all devices before deleting them
+    if CONFIG.sso_enabled() {
+        let devices = Device::find_by_user(&user.uuid, &conn).await;
+        for device in &devices {
+            sso::logout_from_keycloak(device, &conn).await;
+        }
+    }
+
     Device::delete_all_by_user(&user.uuid, &conn).await?;
     user.reset_security_stamp();
     user.enabled = false;

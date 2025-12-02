@@ -11,7 +11,7 @@ use crate::{
     auth,
     auth::{AuthMethod, AuthTokens, TokenWrapper, BW_EXPIRATION, DEFAULT_REFRESH_VALIDITY},
     db::{
-        models::{Device, SsoNonce, User},
+        models::{Device, SsoNonce, SsoUser, User},
         DbConn,
     },
     sso_client::Client,
@@ -468,5 +468,75 @@ pub async fn exchange_refresh_token(
             _create_auth_tokens(device, None, access_claims, access_token)
         }
         None => err!("No token present while in SSO"),
+    }
+}
+
+/// Extract SSO refresh token from device's refresh_token JWT
+/// Returns None if the user is not using SSO or if refresh token is not available
+pub async fn extract_sso_refresh_token(device: &Device, conn: &DbConn) -> Option<String> {
+    // Only proceed if SSO is enabled
+    if !CONFIG.sso_enabled() {
+        return None;
+    }
+
+    // Get user to check if they're using SSO
+    let user = match User::find_by_uuid(&device.user_uuid, conn).await {
+        None => return None,
+        Some(u) => u,
+    };
+
+    // Check if user has SSO user record
+    let _sso_user = match SsoUser::find_by_mail(&user.email, conn).await {
+        None => return None,
+        Some((_, sso_user)) => sso_user,
+    };
+
+    // Try to decode the refresh token JWT
+    let refresh_claims = match auth::decode_refresh(&device.refresh_token) {
+        Ok(claims) => claims,
+        Err(_) => return None,
+    };
+
+    // Check if this is an SSO login
+    if refresh_claims.sub != AuthMethod::Sso {
+        return None;
+    }
+
+    // Extract the SSO refresh token from the token wrapper
+    match refresh_claims.token {
+        Some(TokenWrapper::Refresh(refresh_token)) => Some(refresh_token),
+        _ => None,
+    }
+}
+
+/// Logout from Keycloak if SSO is enabled and refresh token is available
+/// Falls back to email-based logout if refresh token is not available
+pub async fn logout_from_keycloak(device: &Device, conn: &DbConn) {
+    // Try to logout using refresh token first
+    if let Some(refresh_token) = extract_sso_refresh_token(device, conn).await {
+        if let Err(e) = Client::logout(refresh_token).await {
+            warn!("Failed to logout from Keycloak using refresh token: {}", e);
+            // Fall back to email-based logout
+            if let Some(user) = User::find_by_uuid(&device.user_uuid, conn).await {
+                logout_from_keycloak_by_email(&user.email).await;
+            }
+        }
+    } else {
+        // If no refresh token available, try email-based logout
+        if let Some(user) = User::find_by_uuid(&device.user_uuid, conn).await {
+            logout_from_keycloak_by_email(&user.email).await;
+        }
+    }
+}
+
+/// Logout user from Keycloak by email using Admin API
+/// This finds the user by email and logs out all their sessions
+pub async fn logout_from_keycloak_by_email(email: &str) {
+    if !CONFIG.sso_enabled() {
+        return;
+    }
+
+    if let Err(e) = Client::logout_by_email(email).await {
+        warn!("Failed to logout from Keycloak by email {}: {}", email, e);
     }
 }

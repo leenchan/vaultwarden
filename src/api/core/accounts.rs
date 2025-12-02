@@ -4,6 +4,7 @@ use crate::db::DbPool;
 use chrono::Utc;
 use rocket::serde::json::Json;
 use serde_json::Value;
+use uuid;
 
 use crate::{
     api::{
@@ -22,6 +23,7 @@ use crate::{
         DbConn,
     },
     mail,
+    sso,
     util::{format_date, NumberOrString},
     CONFIG,
 };
@@ -66,6 +68,7 @@ pub fn routes() -> Vec<rocket::Route> {
         put_device_token,
         put_clear_device_token,
         post_clear_device_token,
+        post_logout,
         post_auth_request,
         get_auth_request,
         put_auth_request,
@@ -378,18 +381,18 @@ async fn post_set_password(data: Json<SetPasswordData>, headers: Headers, conn: 
     }
 
     if let Some(identifier) = data.org_identifier {
-        if identifier != crate::sso::FAKE_IDENTIFIER {
-            let org = match Organization::find_by_uuid(&identifier.into(), &conn).await {
-                None => err!("Failed to retrieve the associated organization"),
-                Some(org) => org,
-            };
-
-            let membership = match Membership::find_by_user_and_org(&user.uuid, &org.uuid, &conn).await {
-                None => err!("Failed to retrieve the invitation"),
-                Some(org) => org,
-            };
-
-            accept_org_invite(&user, membership, None, &conn).await?;
+        if identifier != sso::FAKE_IDENTIFIER {
+            // Only process if identifier is a valid UUID format
+            if uuid::Uuid::parse_str(&identifier).is_ok() {
+                if let Some(org) = Organization::find_by_uuid(&identifier.into(), &conn).await {
+                    if let Some(membership) = Membership::find_by_user_and_org(&user.uuid, &org.uuid, &conn).await {
+                        accept_org_invite(&user, membership, None, &conn).await?;
+                    }
+                    // If membership not found, silently skip - user may not have an invitation yet
+                }
+                // If organization not found, silently skip - identifier may be invalid or user may not have an org
+            }
+            // If identifier is not a valid UUID, silently skip - it might be SSO client ID or other non-UUID identifier
         }
     }
 
@@ -924,6 +927,14 @@ async fn post_sstamp(data: Json<PasswordOrOtpData>, headers: Headers, conn: DbCo
 
     data.validate(&user, true, &conn).await?;
 
+    // Logout from Keycloak for all devices before deleting them
+    if CONFIG.sso_enabled() {
+        let devices = Device::find_by_user(&user.uuid, &conn).await;
+        for device in &devices {
+            sso::logout_from_keycloak(device, &conn).await;
+        }
+    }
+
     Device::delete_all_by_user(&user.uuid, &conn).await?;
     user.reset_security_stamp();
     let save_result = user.save(&conn).await;
@@ -1443,6 +1454,29 @@ async fn put_clear_device_token(device_id: DeviceId, conn: DbConn) -> EmptyResul
 #[post("/devices/identifier/<device_id>/clear-token")]
 async fn post_clear_device_token(device_id: DeviceId, conn: DbConn) -> EmptyResult {
     put_clear_device_token(device_id, conn).await
+}
+
+#[post("/accounts/logout")]
+async fn post_logout(headers: Headers, conn: DbConn) -> EmptyResult {
+    let device = &headers.device;
+    let user = &headers.user;
+
+    // Logout from Keycloak if SSO is enabled
+    if CONFIG.sso_enabled() {
+        sso::logout_from_keycloak(device, &conn).await;
+    }
+
+    // Unregister push device if push is enabled
+    if CONFIG.push_enabled() {
+        if let Err(e) = unregister_push_device(&device.push_uuid).await {
+            warn!("Failed to unregister push device during logout: {}", e);
+        }
+    }
+
+    // Delete the current device
+    Device::delete_by_uuid_and_user(&device.uuid, &user.uuid, &conn).await?;
+
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]

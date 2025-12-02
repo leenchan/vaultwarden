@@ -224,7 +224,9 @@ fn config() -> Json<Value> {
           "url": "https://github.com/dani-garcia/vaultwarden"
         },
         "settings": {
-            "disableUserRegistration": crate::CONFIG.is_signup_disabled()
+            "disableUserRegistration": crate::CONFIG.is_signup_disabled(),
+            "ssoOnly": crate::CONFIG.sso_only(),
+            "ssoClientId": crate::CONFIG.sso_client_id()
         },
         "environment": {
           "vault": domain,
