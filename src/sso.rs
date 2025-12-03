@@ -7,7 +7,7 @@ use regex::Regex;
 use url::Url;
 
 use crate::{
-    api::ApiResult,
+    api::{ApiResult, EmptyResult},
     auth,
     auth::{AuthMethod, AuthTokens, TokenWrapper, BW_EXPIRATION, DEFAULT_REFRESH_VALIDITY},
     db::{
@@ -469,4 +469,37 @@ pub async fn exchange_refresh_token(
         }
         None => err!("No token present while in SSO"),
     }
+}
+
+/// Extract Keycloak refresh token from Vaultwarden refresh token JWT and logout from Keycloak
+pub async fn logout_from_keycloak(refresh_token: String) -> EmptyResult {
+    // Decode the Vaultwarden refresh token JWT
+    let refresh_claims = match auth::decode_refresh(&refresh_token) {
+        Err(err) => {
+            warn!("Failed to decode refresh token for logout: {}", err);
+            return Ok(()); // If we can't decode, just return Ok - token might be invalid already
+        }
+        Ok(claims) => claims,
+    };
+
+    // Extract Keycloak refresh token from the token field
+    match refresh_claims.token {
+        Some(TokenWrapper::Refresh(keycloak_refresh_token)) => {
+            // Call Keycloak logout
+            if let Err(e) = Client::logout(keycloak_refresh_token).await {
+                warn!("Failed to logout from Keycloak: {}", e);
+                // Don't fail the logout if Keycloak logout fails - the token might already be invalid
+            }
+        }
+        Some(TokenWrapper::Access(_)) => {
+            // If we only have access token, we can't logout from Keycloak
+            // This is okay - the access token will expire naturally
+            debug!("No Keycloak refresh token available for logout, only access token");
+        }
+        None => {
+            debug!("No token available for Keycloak logout");
+        }
+    }
+
+    Ok(())
 }

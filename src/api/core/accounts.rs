@@ -22,6 +22,7 @@ use crate::{
         DbConn,
     },
     mail,
+    sso,
     util::{format_date, NumberOrString},
     CONFIG,
 };
@@ -53,6 +54,7 @@ pub fn routes() -> Vec<rocket::Route> {
         post_delete_recover_token,
         post_delete_account,
         delete_account,
+        post_logout,
         revision_date,
         password_hint,
         prelogin,
@@ -380,7 +382,7 @@ async fn post_set_password(data: Json<SetPasswordData>, headers: Headers, conn: 
     // Try to find and accept organization invitation if org_identifier is provided
     // This is optional - if organization is not found, we still proceed with setting password
     if let Some(identifier) = data.org_identifier {
-        if identifier != crate::sso::FAKE_IDENTIFIER {
+        if identifier != sso::FAKE_IDENTIFIER {
             // Try to find organization by UUID first, then by name (identifier)
             // Note: identifier might be either UUID or organization name
             let org = if let Some(org) = Organization::find_by_uuid(&identifier.clone().into(), &conn).await {
@@ -1196,6 +1198,39 @@ async fn delete_account(data: Json<PasswordOrOtpData>, headers: Headers, conn: D
     data.validate(&user, true, &conn).await?;
 
     user.delete(&conn).await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LogoutData {
+    refresh_token: String,
+}
+
+#[post("/accounts/logout", data = "<data>")]
+async fn post_logout(data: Json<LogoutData>, headers: Headers, conn: DbConn) -> EmptyResult {
+    let data: LogoutData = data.into_inner();
+    let user = headers.user;
+    let device_id = headers.device.uuid.clone();
+
+    // If SSO is enabled, logout from Keycloak
+    if CONFIG.sso_enabled() {
+        if let Err(e) = sso::logout_from_keycloak(data.refresh_token.clone()).await {
+            warn!("Failed to logout from Keycloak for user {}: {}", user.uuid, e);
+            // Continue with device deletion even if Keycloak logout fails
+        }
+    }
+
+    // Delete the current device
+    Device::delete_by_uuid_and_user(&device_id, &user.uuid, &conn).await?;
+
+    // Unregister push device if push is enabled
+    if CONFIG.push_enabled() {
+        if let Err(e) = unregister_push_device(&headers.device.push_uuid).await {
+            warn!("Unable to unregister device from Bitwarden server: {}", e);
+        }
+    }
+
+    Ok(())
 }
 
 #[get("/accounts/revision-date")]

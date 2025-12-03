@@ -174,6 +174,18 @@ impl Device {
         }}
     }
 
+    pub async fn delete_by_uuid_and_user(uuid: &DeviceId, user_uuid: &UserId, conn: &DbConn) -> EmptyResult {
+        db_run! { conn: {
+            diesel::delete(
+                devices::table
+                    .filter(devices::uuid.eq(uuid))
+                    .filter(devices::user_uuid.eq(user_uuid))
+            )
+            .execute(conn)
+            .map_res("Error deleting device")
+        }}
+    }
+
     pub async fn find_by_uuid_and_user(uuid: &DeviceId, user_uuid: &UserId, conn: &DbConn) -> Option<Self> {
         db_run! { conn: {
             devices::table

@@ -242,6 +242,60 @@ impl Client {
             token_response.expires_in(),
         ))
     }
+
+    /// Logout from Keycloak using refresh token
+    /// This calls the Keycloak logout endpoint to invalidate the SSO session
+    pub async fn logout(refresh_token: String) -> EmptyResult {
+        // Construct logout URL from issuer URL
+        // Keycloak logout endpoint is typically at /protocol/openid-connect/logout
+        let issuer_url = CONFIG.sso_issuer_url()?;
+        let logout_url = match issuer_url.join("/protocol/openid-connect/logout") {
+            Ok(url) => url,
+            Err(e) => err!(format!("Failed to construct logout URL: {}", e)),
+        };
+
+        // Prepare logout request parameters
+        let client_id = CONFIG.sso_client_id();
+        let client_secret = CONFIG.sso_client_secret();
+        
+        let mut params = std::collections::HashMap::new();
+        params.insert("refresh_token", refresh_token);
+        params.insert("client_id", client_id);
+        params.insert("client_secret", client_secret);
+
+        // Get HTTP client (we need a fresh client for the request)
+        let http_client = match reqwest::ClientBuilder::new()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+        {
+            Err(err) => err!(format!("Failed to build http client: {err}")),
+            Ok(client) => client,
+        };
+
+        // Build the request
+        let response = match http_client
+            .post(logout_url.as_str())
+            .form(&params)
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => err!(format!("Failed to send logout request: {}", e)),
+        };
+
+        // Keycloak logout endpoint returns 204 No Content on success, or 400/401 on error
+        // We consider it successful if we get any response (even if it's an error from Keycloak)
+        // because the token might already be invalid
+        let status = response.status();
+        if status.is_success() || status == 400 || status == 401 {
+            Ok(())
+        } else {
+            let error_text = response.text().await.unwrap_or_default();
+            warn!("Keycloak logout returned status {}: {}", status, error_text);
+            // Still return Ok() as the logout attempt was made
+            Ok(())
+        }
+    }
 }
 
 trait AuthorizationRequestExt<'a> {
