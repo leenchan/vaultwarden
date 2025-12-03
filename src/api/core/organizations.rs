@@ -1109,7 +1109,8 @@ async fn send_invite(
 
     let mut user_created: bool = false;
     for email in data.emails.iter() {
-        let mut member_status = MembershipStatus::Invited as i32;
+        // Always set status to Accepted to skip the invitation acceptance step
+        let member_status = MembershipStatus::Accepted as i32;
         let user = match User::find_by_mail(email, &conn).await {
             None => {
                 if !CONFIG.invitations_allowed() {
@@ -1133,10 +1134,7 @@ async fn send_invite(
                 if Membership::find_by_user_and_org(&user.uuid, &org_id, &conn).await.is_some() {
                     err!(format!("User already in organization: {email}"))
                 } else {
-                    // automatically accept existing users if mail is disabled
-                    if !CONFIG.mail_enabled() && !user.password_hash.is_empty() {
-                        member_status = MembershipStatus::Accepted as i32;
-                    }
+                    // Status is already set to Accepted above
                     user
                 }
             }
