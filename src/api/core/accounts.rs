@@ -377,19 +377,49 @@ async fn post_set_password(data: Json<SetPasswordData>, headers: Headers, conn: 
         user.public_key = Some(keys.public_key);
     }
 
+    // Try to find and accept organization invitation if org_identifier is provided
+    // This is optional - if organization is not found, we still proceed with setting password
     if let Some(identifier) = data.org_identifier {
         if identifier != crate::sso::FAKE_IDENTIFIER {
-            let org = match Organization::find_by_uuid(&identifier.into(), &conn).await {
-                None => err!("Failed to retrieve the associated organization"),
-                Some(org) => org,
+            // Try to find organization by UUID first, then by name (identifier)
+            // Note: identifier might be either UUID or organization name
+            let org = if let Some(org) = Organization::find_by_uuid(&identifier.clone().into(), &conn).await {
+                Some(org)
+            } else if let Some(org) = Organization::find_by_name(&identifier, &conn).await {
+                Some(org)
+            } else {
+                // Try case-insensitive match by getting all orgs and comparing
+                let all_orgs = Organization::get_all(&conn).await;
+                all_orgs.into_iter().find(|o| o.name.eq_ignore_ascii_case(&identifier))
             };
 
-            let membership = match Membership::find_by_user_and_org(&user.uuid, &org.uuid, &conn).await {
-                None => err!("Failed to retrieve the invitation"),
-                Some(org) => org,
-            };
-
-            accept_org_invite(&user, membership, None, &conn).await?;
+            if let Some(org) = org {
+                // Organization found, try to accept invitation
+                if let Some(membership) = Membership::find_by_user_and_org(&user.uuid, &org.uuid, &conn).await {
+                    // User has membership, accept the invitation
+                    if let Err(e) = accept_org_invite(&user, membership, None, &conn).await {
+                        // Log error but don't fail the password setting
+                        error!(
+                            "Failed to accept organization invitation. User: {}, Org: {} (name: '{}'), Identifier: '{}', Error: {}",
+                            user.uuid, org.uuid, org.name, identifier, e
+                        );
+                    }
+                } else {
+                    // Organization found but user is not a member
+                    // This is not an error - user can still set password and activate account
+                    info!(
+                        "Organization '{}' found but user {} is not a member. Proceeding with password setup.",
+                        org.name, user.uuid
+                    );
+                }
+            } else {
+                // Organization not found - this is not an error
+                // User can still set password and activate account
+                info!(
+                    "Organization not found for identifier '{}'. User {} will set password without joining organization.",
+                    identifier, user.uuid
+                );
+            }
         }
     }
 
