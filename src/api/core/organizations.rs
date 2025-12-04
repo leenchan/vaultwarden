@@ -2321,11 +2321,8 @@ async fn import(org_id: OrganizationId, data: Json<OrgImportData>, headers: Head
         // If user is not part of the organization, but it exists
         } else if Membership::find_by_email_and_org(&user_data.email, &org_id, &conn).await.is_none() {
             if let Some(user) = User::find_by_mail(&user_data.email, &conn).await {
-                let member_status = if CONFIG.mail_enabled() {
-                    MembershipStatus::Invited as i32
-                } else {
-                    MembershipStatus::Accepted as i32 // Automatically mark user as accepted if no email invites
-                };
+                // Always set status to Accepted to skip the invitation acceptance step
+                let member_status = MembershipStatus::Accepted as i32;
 
                 let mut new_member =
                     Membership::new(user.uuid.clone(), org_id.clone(), Some(headers.user.email.clone()));
