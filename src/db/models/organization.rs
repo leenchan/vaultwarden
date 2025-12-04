@@ -656,6 +656,7 @@ impl Membership {
             "twoFactorEnabled": twofactor_enabled,
             "resetPasswordEnrolled": self.reset_password_key.is_some(),
             "hasMasterPassword": !user.password_hash.is_empty(),
+            "enabled": user.enabled,
 
             "permissions": permissions,
 

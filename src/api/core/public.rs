@@ -8,20 +8,23 @@ use rocket::{
 use std::collections::HashSet;
 
 use crate::{
-    api::EmptyResult,
+    api::{EmptyResult, JsonResult},
     auth,
     db::{
         models::{
-            Group, GroupUser, Invitation, Membership, MembershipStatus, MembershipType, Organization,
+            Group, GroupUser, Invitation, Membership, MembershipId, MembershipStatus, MembershipType, Organization,
             OrganizationApiKey, OrganizationId, User,
         },
         DbConn,
     },
     mail, CONFIG,
 };
+use data_encoding::BASE64;
+use serde::Deserialize;
+use serde_json::json;
 
 pub fn routes() -> Vec<Route> {
-    routes![ldap_import]
+    routes![ldap_import, get_public_members, bulk_confirm_public_members]
 }
 
 #[derive(Deserialize)]
@@ -38,6 +41,10 @@ struct OrgImportUserData {
     email: String,
     external_id: String,
     deleted: bool,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -90,8 +97,8 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
             }
         } else {
             // If user is not part of the organization
-            let user = match User::find_by_mail(&user_data.email, &conn).await {
-                Some(user) => user, // exists in vaultwarden
+            let mut user = match User::find_by_mail(&user_data.email, &conn).await {
+                Some(u) => u, // exists in vaultwarden
                 None => {
                     // User does not exist yet
                     let mut new_user = User::new(&user_data.email, None);
@@ -104,11 +111,31 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
                     new_user
                 }
             };
-            let member_status = if CONFIG.mail_enabled() || user.password_hash.is_empty() {
-                MembershipStatus::Invited as i32
-            } else {
-                MembershipStatus::Accepted as i32 // Automatically mark user as accepted if no email invites
-            };
+            
+            // If password and key are provided, set them
+            // This allows setting master password during import
+            if let (Some(password), Some(key)) = (&user_data.password, &user_data.key) {
+                if !password.is_empty() && !key.is_empty() {
+                    // Generate master_password_hash similar to frontend
+                    // Step 1: Generate masterKey using client KDF (PBKDF2 with email as salt)
+                    let email_salt = user.email.trim().to_lowercase();
+                    let client_kdf_iter = user.client_kdf_iter;
+                    let master_key = crate::crypto::hash_password(password.as_bytes(), email_salt.as_bytes(), client_kdf_iter as u32);
+                    
+                    // Step 2: Generate master_password_hash using masterKey and password
+                    // hashMasterKey: PBKDF2(masterKey.inner().encryptionKey, masterPassword, 1)
+                    let master_password_hash_bytes = crate::crypto::hash_password(password.as_bytes(), &master_key, 1);
+                    
+                    // Step 3: Convert to base64 string (as client would send)
+                    let master_password_hash = BASE64.encode(&master_password_hash_bytes);
+                    
+                    // Step 4: Set password and key
+                    user.set_password(&master_password_hash, Some(key.clone()), false, None);
+                    user.save(&conn).await?;
+                }
+            }
+            // Always set status to Accepted to skip the invitation acceptance step
+            let member_status = MembershipStatus::Accepted as i32;
 
             let (org_name, org_email) = match Organization::find_by_uuid(&org_id, &conn).await {
                 Some(org) => (org.name, org.billing_email),
@@ -191,6 +218,138 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
     }
 
     Ok(())
+}
+
+#[get("/public/organization/members")]
+async fn get_public_members(token: PublicToken, conn: DbConn) -> JsonResult {
+    let org_id = token.0;
+    let mut members_json = Vec::new();
+    
+    for m in Membership::find_by_org(&org_id, &conn).await {
+        // Get user info
+        let user = match User::find_by_uuid(&m.user_uuid, &conn).await {
+            Some(u) => u,
+            None => continue,
+        };
+        
+        // Determine status name
+        let status_name = match MembershipStatus::from_i32(m.status) {
+            Some(MembershipStatus::Invited) => "Invited",
+            Some(MembershipStatus::Accepted) => "Accepted",
+            Some(MembershipStatus::Confirmed) => "Confirmed",
+            Some(MembershipStatus::Revoked) => "Revoked",
+            None => "Unknown",
+        };
+        
+        members_json.push(json!({
+            "id": m.uuid,
+            "userId": m.user_uuid,
+            "email": user.email,
+            "name": user.name,
+            "status": m.status,
+            "statusName": status_name,
+            "type": m.atype,
+            "accessAll": m.access_all,
+            "externalId": m.external_id,
+        }));
+    }
+
+    Ok(Json(json!({
+        "data": members_json,
+        "object": "list",
+        "continuationToken": null,
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BulkConfirmPublicData {
+    member_ids: Vec<MembershipId>,
+}
+
+#[post("/public/organization/members/confirm", data = "<data>")]
+async fn bulk_confirm_public_members(
+    data: Json<BulkConfirmPublicData>,
+    token: PublicToken,
+    conn: DbConn,
+) -> JsonResult {
+    let org_id = token.0;
+    let data = data.into_inner();
+    let member_ids = data.member_ids.clone();
+    let total_count = member_ids.len();
+    
+    let mut results = Vec::new();
+    let mut confirmed_count = 0;
+    let mut failed_count = 0;
+    
+    for member_id in &member_ids {
+        let result = match Membership::find_by_uuid_and_org(&member_id, &org_id, &conn).await {
+            Some(mut member) => {
+                // Check if member is in Accepted status (needs confirmation)
+                if member.status == MembershipStatus::Accepted as i32 {
+                    // Update status to Confirmed
+                    // Note: akey should be set by the user when they first access the organization
+                    // We cannot generate a valid encrypted akey here because we don't have the user's encryption key
+                    // If akey is empty, it will remain empty and the frontend will handle setting it
+                    // when the user actually accesses the organization
+                    member.status = MembershipStatus::Confirmed as i32;
+                    
+                    match member.save(&conn).await {
+                        Ok(_) => {
+                            confirmed_count += 1;
+                            json!({
+                                "id": member_id,
+                                "status": "success",
+                                "message": "Member confirmed successfully"
+                            })
+                        }
+                        Err(e) => {
+                            failed_count += 1;
+                            json!({
+                                "id": member_id,
+                                "status": "error",
+                                "message": format!("Failed to save: {}", e)
+                            })
+                        }
+                    }
+                } else {
+                    let status_name = match MembershipStatus::from_i32(member.status) {
+                        Some(MembershipStatus::Invited) => "Invited",
+                        Some(MembershipStatus::Accepted) => "Accepted",
+                        Some(MembershipStatus::Confirmed) => "Confirmed",
+                        Some(MembershipStatus::Revoked) => "Revoked",
+                        None => "Unknown",
+                    };
+                    json!({
+                        "id": member_id,
+                        "status": "skipped",
+                        "message": format!("Member is in {} status, not Accepted", status_name)
+                    })
+                }
+            }
+            None => {
+                failed_count += 1;
+                json!({
+                    "id": member_id,
+                    "status": "error",
+                    "message": "Member not found"
+                })
+            }
+        };
+        
+        results.push(result);
+    }
+    
+    Ok(Json(json!({
+        "data": results,
+        "object": "list",
+        "summary": {
+            "total": total_count,
+            "confirmed": confirmed_count,
+            "failed": failed_count,
+            "skipped": total_count - confirmed_count - failed_count
+        }
+    })))
 }
 
 pub struct PublicToken(OrganizationId);
