@@ -527,7 +527,8 @@ impl Membership {
 
             // These are per user
             "userId": self.user_uuid,
-            "key": self.akey,
+            // Return null if akey is empty to prevent EncString parsing errors in frontend
+            "key": if self.akey.is_empty() { Value::Null } else { json!(self.akey) },
             "status": self.status,
             "type": membership_type,
             "enabled": true,

@@ -237,7 +237,9 @@ impl User {
 impl User {
     pub async fn to_json(&self, conn: &DbConn) -> Value {
         let mut orgs_json = Vec::new();
-        for c in Membership::find_confirmed_by_user(&self.uuid, conn).await {
+        // Include all memberships (not just Confirmed) to support users setting initial password
+        // when they are in Accepted or Invited status
+        for c in Membership::find_by_user(&self.uuid, conn).await {
             orgs_json.push(c.to_json(conn).await);
         }
 
